@@ -1,0 +1,10 @@
+Create Okta configuration file:
+
+sudo tee /etc/pam_okta.conf << EOF
+okta_domain=your-domain.okta.com
+client_id=your-client-id
+client_secret=your-client-secret
+redirect_uri=http://localhost:8000/callback
+EOF
+
+sudo chmod 600 /etc/pam_okta.conf
