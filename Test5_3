@@ -1,0 +1,152 @@
+Part 3/3 - PAM interface functions:
+
+```c
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    const char *input_username = NULL;
+    char *okta_password = NULL;
+    char *actual_username = NULL;
+    char *local_username = NULL;
+    int retval;
+
+    // Load configuration and initialize logging
+    load_config();
+    openlog("pam_okta", LOG_PID, LOG_AUTH);
+
+    // Get username
+    retval = pam_get_user(pamh, &input_username, NULL);
+    if (retval != PAM_SUCCESS) {
+        file_debug_log("%s: Failed to get username", LOG_PREFIX);
+        return retval;
+    }
+
+    file_debug_log("%s: Initial input username: %s", LOG_PREFIX, input_username);
+
+    // Handle email login via SSH (username@domain.com@host format)
+    if (is_email_login(input_username)) {
+        file_debug_log("%s: Detected email login format", LOG_PREFIX);
+        actual_username = extract_email_from_ssh(input_username);
+        if (!actual_username) {
+            file_debug_log("%s: Failed to extract email from SSH input", LOG_PREFIX);
+            return PAM_AUTH_ERR;
+        }
+        file_debug_log("%s: Extracted email from SSH input: %s", LOG_PREFIX, actual_username);
+    } else if (strchr(input_username, '@')) {
+        // Single @ - might be direct email usage
+        actual_username = strdup(input_username);
+        file_debug_log("%s: Using direct email input: %s", LOG_PREFIX, actual_username);
+    } else {
+        // No @ - regular username
+        actual_username = strdup(input_username);
+        file_debug_log("%s: Using regular username: %s", LOG_PREFIX, actual_username);
+    }
+
+    if (!actual_username) {
+        file_debug_log("%s: Failed to allocate memory for username", LOG_PREFIX);
+        return PAM_SYSTEM_ERR;
+    }
+
+    // Extract local username
+    local_username = extract_local_username(actual_username);
+    if (!local_username) {
+        file_debug_log("%s: Failed to extract local username", LOG_PREFIX);
+        free(actual_username);
+        return PAM_SYSTEM_ERR;
+    }
+
+    file_debug_log("%s: Local username: %s", LOG_PREFIX, local_username);
+
+    // Check if local user exists
+    if (!user_exists(local_username)) {
+        file_debug_log("%s: Local user %s does not exist", LOG_PREFIX, local_username);
+        free(local_username);
+        free(actual_username);
+        return PAM_USER_UNKNOWN;
+    }
+
+    // Set the local username for subsequent modules
+    retval = pam_set_item(pamh, PAM_USER, local_username);
+    if (retval != PAM_SUCCESS) {
+        file_debug_log("%s: Failed to set PAM_USER to %s", LOG_PREFIX, local_username);
+        free(local_username);
+        free(actual_username);
+        return retval;
+    }
+
+    // Try Okta authentication if we have an email address
+    if (strchr(actual_username, '@')) {
+        file_debug_log("%s: Email format detected (%s), trying Okta authentication", 
+                      LOG_PREFIX, actual_username);
+
+        // Get Okta password
+        const char *prompt = "Okta Password: ";
+        char *resp = NULL;
+        retval = pam_prompt(pamh, PAM_PROMPT_ECHO_OFF, &resp, "%s", prompt);
+        
+        if (retval != PAM_SUCCESS || !resp) {
+            file_debug_log("%s: Failed to get Okta password", LOG_PREFIX);
+            free(local_username);
+            free(actual_username);
+            return PAM_AUTH_ERR;
+        }
+
+        okta_password = strdup(resp);
+        free(resp);
+
+        if (!okta_password) {
+            file_debug_log("%s: Memory allocation failed for password", LOG_PREFIX);
+            free(local_username);
+            free(actual_username);
+            return PAM_SYSTEM_ERR;
+        }
+
+        file_debug_log("%s: Attempting Okta authentication for %s", LOG_PREFIX, actual_username);
+        
+        if (authenticate_with_okta(actual_username, okta_password)) {
+            file_debug_log("%s: Okta authentication successful for %s", 
+                          LOG_PREFIX, actual_username);
+            
+            // Cleanup
+            memset(okta_password, 0, strlen(okta_password));
+            free(okta_password);
+            free(local_username);
+            free(actual_username);
+            
+            return PAM_SUCCESS;
+        }
+
+        file_debug_log("%s: Okta authentication failed for %s, falling back to local auth", 
+                      LOG_PREFIX, actual_username);
+
+        // Cleanup
+        memset(okta_password, 0, strlen(okta_password));
+        free(okta_password);
+    } else {
+        file_debug_log("%s: No email format detected, skipping Okta auth", LOG_PREFIX);
+    }
+
+    // Cleanup
+    free(local_username);
+    free(actual_username);
+    return PAM_AUTH_ERR;
+}
+
+PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
+
+/* Static module data */
+#ifdef PAM_STATIC
+struct pam_module _pam_okta_modstruct = {
+    "pam_okta",
+    pam_sm_authenticate,
+    pam_sm_setcred,
+    pam_sm_acct_mgmt,
+    NULL,
+    NULL,
+    NULL
+};
+#endif
