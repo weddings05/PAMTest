@@ -1,0 +1,194 @@
+// Modified authentication function with better response handling
+static int authenticate_with_okta(pam_handle_t* pamh, const char* username, 
+                                const char* password, struct OktaConfig* config) {
+    debug_log("Starting Okta authentication for user: %s", username);
+    
+    CURL* curl;
+    CURLcode res;
+    struct MemoryStruct chunk;
+    int ret = PAM_AUTH_ERR;
+
+    chunk.memory = malloc(1);
+    chunk.size = 0;
+
+    curl = curl_easy_init();
+    if (!curl) {
+        debug_log("Failed to initialize CURL");
+        free(chunk.memory);
+        return PAM_AUTH_ERR;
+    }
+
+    // Prepare authentication request
+    char post_data[MAX_LINE * 3];
+    snprintf(post_data, sizeof(post_data),
+             "{\"username\":\"%s\",\"password\":\"%s\"}",
+             username, password);
+
+    debug_log("Authentication endpoint: %s", config->auth_endpoint);
+
+    struct curl_slist* headers = NULL;
+    headers = curl_slist_append(headers, "Accept: application/json");
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, config->auth_endpoint);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)&chunk);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);  // Add verbose output
+
+    debug_log("Sending authentication request to Okta");
+    res = curl_easy_perform(curl);
+
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    debug_log("HTTP Response Code: %ld", http_code);
+
+    if (res != CURLE_OK) {
+        debug_log("CURL request failed: %s", curl_easy_strerror(res));
+        ret = PAM_AUTH_ERR;
+        goto cleanup;
+    }
+
+    // Log the response for debugging
+    debug_log("Received response from Okta (length: %zu)", chunk.size);
+    if (chunk.size > 0) {
+        debug_log("Response content: %.*s", (int)chunk.size, chunk.memory);
+    }
+
+    // Check for error response first
+    if (strstr(chunk.memory, "\"errorCode\"")) {
+        debug_log("Okta returned an error response");
+        char* error_code = extract_json_string(chunk.memory, "errorCode");
+        char* error_message = extract_json_string(chunk.memory, "errorSummary");
+        if (error_code) {
+            debug_log("Error code: %s", error_code);
+        }
+        if (error_message) {
+            debug_log("Error message: %s", error_message);
+        }
+        ret = PAM_AUTH_ERR;
+        goto cleanup;
+    }
+
+    // Check authentication status
+    const char* status = extract_json_string(chunk.memory, "status");
+    if (!status) {
+        debug_log("Could not find status in response");
+        ret = PAM_AUTH_ERR;
+        goto cleanup;
+    }
+
+    debug_log("Authentication status: %s", status);
+
+    if (strcmp(status, "SUCCESS") == 0) {
+        debug_log("Authentication successful");
+        ret = PAM_SUCCESS;
+    } else if (strcmp(status, "MFA_REQUIRED") == 0) {
+        debug_log("MFA required");
+        
+        const char* state_token = extract_json_string(chunk.memory, "stateToken");
+        if (!state_token) {
+            debug_log("Could not get state token for MFA");
+            ret = PAM_AUTH_ERR;
+            goto cleanup;
+        }
+
+        // Get MFA code
+        char* mfa_code = NULL;
+        int prompt_ret = prompt_user(pamh, PAM_PROMPT_ECHO_ON,
+                                   "Enter your MFA code: ", &mfa_code);
+        if (prompt_ret != PAM_SUCCESS || !mfa_code) {
+            debug_log("Failed to get MFA code");
+            ret = PAM_AUTH_ERR;
+            goto cleanup;
+        }
+
+        // Clear previous response
+        free(chunk.memory);
+        chunk.memory = malloc(1);
+        chunk.size = 0;
+
+        // Prepare MFA verification request
+        snprintf(post_data, sizeof(post_data),
+                "{\"stateToken\":\"%s\",\"passCode\":\"%s\"}",
+                state_token, mfa_code);
+
+        debug_log("Sending MFA verification request");
+
+        // Clean up sensitive data
+        memset(mfa_code, 0, strlen(mfa_code));
+        free(mfa_code);
+
+        res = curl_easy_perform(curl);
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        debug_log("MFA HTTP Response Code: %ld", http_code);
+
+        if (res != CURLE_OK) {
+            debug_log("MFA verification request failed: %s", curl_easy_strerror(res));
+            ret = PAM_AUTH_ERR;
+            goto cleanup;
+        }
+
+        debug_log("MFA Response: %.*s", (int)chunk.size, chunk.memory);
+
+        if (strstr(chunk.memory, "\"status\":\"SUCCESS\"")) {
+            debug_log("MFA verification successful");
+            ret = PAM_SUCCESS;
+        } else {
+            debug_log("MFA verification failed");
+            ret = PAM_AUTH_ERR;
+        }
+    } else {
+        debug_log("Authentication failed with status: %s", status);
+        ret = PAM_AUTH_ERR;
+    }
+
+cleanup:
+    if (ret != PAM_SUCCESS) {
+        debug_log("Authentication failed, returning PAM_AUTH_ERR");
+    }
+    free(chunk.memory);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return ret;
+}
+
+// Update the extract_json_string function for better error handling
+static char* extract_json_string(const char* json, const char* key) {
+    static char value[MAX_LINE];
+    char search_key[MAX_LINE];
+    snprintf(search_key, sizeof(search_key), "\"%s\":\"", key);
+    
+    if (!json || !key) {
+        debug_log("extract_json_string: NULL input");
+        return NULL;
+    }
+    
+    debug_log("Searching for key: %s", key);
+    
+    char* start = strstr(json, search_key);
+    if (!start) {
+        debug_log("Key '%s' not found in JSON", key);
+        return NULL;
+    }
+    
+    start += strlen(search_key);
+    char* end = strchr(start, '"');
+    if (!end) {
+        debug_log("No closing quote found for key '%s'", key);
+        return NULL;
+    }
+    
+    size_t length = end - start;
+    if (length >= MAX_LINE) {
+        debug_log("Value too long for key '%s'", key);
+        return NULL;
+    }
+    
+    strncpy(value, start, length);
+    value[length] = '\0';
+    debug_log("Found value for key '%s': %s", key, value);
+    return value;
+}
