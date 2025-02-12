@@ -1,0 +1,359 @@
+#define PAM_SM_AUTH
+#include <security/pam_modules.h>
+#include <security/pam_ext.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <curl/curl.h>
+#include <syslog.h>
+#include <unistd.h>
+
+#define CONFIG_FILE "/etc/pam_okta.conf"
+#define MAX_BUFFER 4096
+#define DEBUG_FILE "/var/log/pam_okta.log"
+
+struct config {
+    char okta_domain[256];
+    char api_token[256];
+};
+
+static struct config conf;
+
+struct string {
+    char *ptr;
+    size_t len;
+};
+
+static void log_message(int priority, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    openlog("pam_okta", LOG_PID, LOG_AUTHPRIV);
+    vsyslog(priority, format, args);
+    closelog();
+    va_end(args);
+
+    FILE *f = fopen(DEBUG_FILE, "a");
+    if (f) {
+        time_t now = time(NULL);
+        char timestamp[64];
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
+        fprintf(f, "[%s] ", timestamp);
+        va_start(args, format);
+        vfprintf(f, format, args);
+        fprintf(f, "\n");
+        va_end(args);
+        fclose(f);
+    }
+}
+
+void init_string(struct string *s) {
+    s->len = 0;
+    s->ptr = malloc(s->len + 1);
+    if (s->ptr == NULL) {
+        log_message(LOG_ERR, "Failed to allocate memory");
+        exit(1);
+    }
+    s->ptr[0] = '\0';
+}
+
+size_t writefunc(void *ptr, size_t size, size_t nmemb, struct string *s) {
+    size_t new_len = s->len + size * nmemb;
+    s->ptr = realloc(s->ptr, new_len + 1);
+    if (s->ptr == NULL) {
+        log_message(LOG_ERR, "Failed to reallocate memory");
+        exit(1);
+    }
+    memcpy(s->ptr + s->len, ptr, size * nmemb);
+    s->ptr[new_len] = '\0';
+    s->len = new_len;
+    return size * nmemb;
+}
+
+static int load_config() {
+    FILE *fp = fopen(CONFIG_FILE, "r");
+    if (!fp) {
+        log_message(LOG_ERR, "Failed to open config file: %s", CONFIG_FILE);
+        return -1;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        char *key = strtok(line, "=");
+        char *value = strtok(NULL, "\n");
+        if (key && value) {
+            while (*value == ' ') value++;
+            char *end = value + strlen(value) - 1;
+            while (end > value && (*end == ' ' || *end == '\n')) *end-- = '\0';
+            
+            if (strcmp(key, "okta_domain") == 0) {
+                strncpy(conf.okta_domain, value, sizeof(conf.okta_domain) - 1);
+            } else if (strcmp(key, "api_token") == 0) {
+                strncpy(conf.api_token, value, sizeof(conf.api_token) - 1);
+            }
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
+static char* get_mfa_answer(pam_handle_t *pamh, const char *prompt) {
+    const struct pam_conv *conv;
+    struct pam_message msg;
+    const struct pam_message *msgp;
+    struct pam_response *resp;
+    int retval;
+
+    retval = pam_get_item(pamh, PAM_CONV, (const void**)&conv);
+    if (retval != PAM_SUCCESS) {
+        return NULL;
+    }
+
+    msg.msg_style = PAM_PROMPT_ECHO_ON;
+    msg.msg = prompt;
+    msgp = &msg;
+    
+    retval = conv->conv(1, &msgp, &resp, conv->appdata_ptr);
+    if (retval != PAM_SUCCESS || !resp) {
+        return NULL;
+    }
+
+    char *answer = strdup(resp->resp);
+    free(resp->resp);
+    free(resp);
+    
+    return answer;
+}
+
+static int handle_mfa(pam_handle_t *pamh, CURL *curl, const char *stateToken) {
+    struct string s;
+    init_string(&s);
+    char url[MAX_BUFFER];
+    snprintf(url, sizeof(url), "https://%s/api/v1/authn/factors", conf.okta_domain);
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Accept: application/json");
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    char auth_header[MAX_BUFFER];
+    snprintf(auth_header, sizeof(auth_header), "Authorization: SSWS %s", conf.api_token);
+    headers = curl_slist_append(headers, auth_header);
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writefunc);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &s);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+
+    if (res != CURLE_OK) {
+        free(s.ptr);
+        return PAM_AUTH_ERR;
+    }
+
+    // For each MFA factor, prompt user and verify
+    // Note: This is a simplified implementation. In practice, you'd want to parse
+    // the factors response and handle each type appropriately
+    char *mfa_code = get_mfa_answer(pamh, "Enter your MFA code: ");
+    if (!mfa_code) {
+        free(s.ptr);
+        return PAM_AUTH_ERR;
+    }
+
+    // Verify MFA code
+    init_string(&s);
+    snprintf(url, sizeof(url), "https://%s/api/v1/authn/factors/verify", conf.okta_domain);
+    
+    char post_data[MAX_BUFFER];
+    snprintf(post_data, sizeof(post_data), 
+             "{\"stateToken\":\"%s\",\"passCode\":\"%s\"}", 
+             stateToken, mfa_code);
+    
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+    
+    res = curl_easy_perform(curl);
+    free(mfa_code);
+
+    if (res != CURLE_OK) {
+        free(s.ptr);
+        return PAM_AUTH_ERR;
+    }
+
+    // Check if MFA verification was successful
+    if (strstr(s.ptr, "\"status\":\"SUCCESS\"")) {
+        free(s.ptr);
+        return PAM_SUCCESS;
+    }
+
+    free(s.ptr);
+    return PAM_AUTH_ERR;
+}
+
+static int verify_okta_credentials(pam_handle_t *pamh, const char *username, const char *password) {
+    CURL *curl;
+    CURLcode res;
+    struct string s;
+    init_string(&s);
+    
+    curl = curl_easy_init();
+    if (!curl) {
+        log_message(LOG_ERR, "Failed to initialize CURL");
+        return PAM_AUTH_ERR;
+    }
+
+    char url[MAX_BUFFER];
+    snprintf(url, sizeof(url), "https://%s/api/v1/authn", conf.okta_domain);
+
+    char post_data[MAX_BUFFER];
+    snprintf(post_data, sizeof(post_data), 
+             "{\"username\":\"%s\",\"password\":\"%s\"}", 
+             username, password);
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Accept: application/json");
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writefunc);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &s);
+
+    res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+
+    if (res != CURLE_OK) {
+        log_message(LOG_ERR, "CURL request failed: %s", curl_easy_strerror(res));
+        free(s.ptr);
+        curl_easy_cleanup(curl);
+        return PAM_AUTH_ERR;
+    }
+
+    // Check authentication response
+    if (strstr(s.ptr, "\"status\":\"SUCCESS\"")) {
+        free(s.ptr);
+        curl_easy_cleanup(curl);
+        return PAM_SUCCESS;
+    } else if (strstr(s.ptr, "\"status\":\"MFA_REQUIRED\"")) {
+        // Extract stateToken for MFA
+        char *state_start = strstr(s.ptr, "\"stateToken\":\"");
+        if (state_start) {
+            state_start += 14;  // Length of "stateToken":"
+            char *state_end = strchr(state_start, '\"');
+            if (state_end) {
+                size_t token_len = state_end - state_start;
+                char *stateToken = malloc(token_len + 1);
+                strncpy(stateToken, state_start, token_len);
+                stateToken[token_len] = '\0';
+                
+                int mfa_result = handle_mfa(pamh, curl, stateToken);
+                free(stateToken);
+                free(s.ptr);
+                curl_easy_cleanup(curl);
+                return mfa_result;
+            }
+        }
+    }
+
+    free(s.ptr);
+    curl_easy_cleanup(curl);
+    return PAM_AUTH_ERR;
+}
+
+static int get_okta_creds(pam_handle_t *pamh, char **username, char **password) {
+    const struct pam_conv *conv;
+    struct pam_message msg_user, msg_pass;
+    const struct pam_message *msgs_user[1], *msgs_pass[1];
+    struct pam_response *resp;
+    
+    int retval = pam_get_item(pamh, PAM_CONV, (const void**)&conv);
+    if (retval != PAM_SUCCESS) {
+        return retval;
+    }
+
+    msg_user.msg_style = PAM_PROMPT_ECHO_ON;
+    msg_user.msg = "Okta Username: ";
+    msgs_user[0] = &msg_user;
+    
+    retval = conv->conv(1, msgs_user, &resp, conv->appdata_ptr);
+    if (retval != PAM_SUCCESS) {
+        return retval;
+    }
+    *username = strdup(resp->resp);
+    free(resp->resp);
+    free(resp);
+
+    msg_pass.msg_style = PAM_PROMPT_ECHO_OFF;
+    msg_pass.msg = "Okta Password: ";
+    msgs_pass[0] = &msg_pass;
+    
+    retval = conv->conv(1, msgs_pass, &resp, conv->appdata_ptr);
+    if (retval != PAM_SUCCESS) {
+        free(*username);
+        return retval;
+    }
+    *password = strdup(resp->resp);
+    free(resp->resp);
+    free(resp);
+
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    char *username = NULL;
+    char *password = NULL;
+    int ret;
+
+    log_message(LOG_INFO, "Starting Okta authentication process");
+
+    if (load_config() != 0) {
+        log_message(LOG_ERR, "Failed to load configuration");
+        return PAM_IGNORE;
+    }
+
+    ret = get_okta_creds(pamh, &username, &password);
+    if (ret != PAM_SUCCESS) {
+        log_message(LOG_ERR, "Failed to get Okta credentials");
+        return PAM_IGNORE;
+    }
+
+    ret = verify_okta_credentials(pamh, username, password);
+    
+    // Clean up sensitive data
+    if (username) {
+        memset(username, 0, strlen(username));
+        free(username);
+    }
+    if (password) {
+        memset(password, 0, strlen(password));
+        free(password);
+    }
+
+    if (ret != PAM_SUCCESS) {
+        log_message(LOG_WARNING, "Okta authentication failed, allowing fallback");
+        return PAM_IGNORE;
+    }
+
+    log_message(LOG_INFO, "Okta authentication successful");
+    return PAM_SUCCESS;
+}
+
+// Other PAM functions remain the same...
+PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_close_session(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_chauthtok(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
