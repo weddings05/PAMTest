@@ -1,0 +1,557 @@
+// pam_okta_auth.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <security/pam_modules.h>
+#include <security/pam_ext.h>
+#include <security/pam_appl.h>
+#include <syslog.h>
+#include <curl/curl.h>
+#include <time.h>
+#include <errno.h>
+#include <unistd.h>
+#include <json-c/json.h>
+
+#define CONFIG_FILE "/etc/exceed/okta-config.txt"
+#define DEBUG_LOG "/var/log/okta_pam_debug.log"
+#define MAX_LINE 1024
+#define MAX_RESPONSE 4096
+#define MAX_FACTORS 10
+#define PUSH_POLL_INTERVAL_MS 500
+#define PUSH_TIMEOUT_SEC 30
+
+// Structure for CURL responses
+struct MemoryStruct {
+    char* memory;
+    size_t size;
+};
+
+// Structure for MFA factors
+struct MFAFactor {
+    char id[MAX_LINE];
+    char type[MAX_LINE];
+    char provider[MAX_LINE];
+    char status[MAX_LINE];
+};
+
+struct MFAFactors {
+    struct MFAFactor factors[MAX_FACTORS];
+    int count;
+};
+
+// Structure for Okta configuration
+struct OktaConfig {
+    char issuer[MAX_LINE];
+    char client_id[MAX_LINE];
+    char client_secret[MAX_LINE];
+    char auth_endpoint[MAX_LINE];
+};
+
+// Debug logging function
+static void debug_log(const char* format, ...) {
+    FILE* fp = fopen(DEBUG_LOG, "a");
+    if (!fp) return;
+
+    time_t now = time(NULL);
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    fprintf(fp, "[%s] ", timestamp);
+    
+    va_list args;
+    va_start(args, format);
+    vfprintf(fp, format, args);
+    va_end(args);
+    
+    fprintf(fp, "\n");
+    fclose(fp);
+}
+
+// CURL write callback
+static size_t WriteMemoryCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    size_t realsize = size * nmemb;
+    struct MemoryStruct* mem = (struct MemoryStruct*)userp;
+
+    char* ptr = realloc(mem->memory, mem->size + realsize + 1);
+    if (!ptr) {
+        debug_log("Failed to allocate memory for CURL response");
+        return 0;
+    }
+
+    mem->memory = ptr;
+    memcpy(&(mem->memory[mem->size]), contents, realsize);
+    mem->size += realsize;
+    mem->memory[mem->size] = 0;
+    
+    return realsize;
+}
+
+// Function to prompt user
+static int prompt_user(pam_handle_t* pamh, int msg_style, const char* prompt, char** response) {
+    const struct pam_conv* conv;
+    int ret = pam_get_item(pamh, PAM_CONV, (const void**)&conv);
+    if (ret != PAM_SUCCESS) {
+        debug_log("Failed to get PAM conversation");
+        return ret;
+    }
+
+    struct pam_message msg;
+    const struct pam_message* msgp;
+    struct pam_response* resp;
+
+    msg.msg_style = msg_style;
+    msg.msg = prompt;
+    msgp = &msg;
+    
+    debug_log("Displaying prompt: %s", prompt);
+    ret = conv->conv(1, &msgp, &resp, conv->appdata_ptr);
+    if (ret != PAM_SUCCESS) {
+        debug_log("Conversation failed: %d", ret);
+        return ret;
+    }
+
+    if (resp == NULL || resp[0].resp == NULL) {
+        debug_log("No response received");
+        free(resp);
+        return PAM_CONV_ERR;
+    }
+
+    *response = strdup(resp[0].resp);
+    debug_log("Received response (length: %zu)", strlen(resp[0].resp));
+    
+    memset(resp[0].resp, 0, strlen(resp[0].resp));
+    free(resp[0].resp);
+    free(resp);
+
+    return PAM_SUCCESS;
+}
+
+// Read configuration
+static int read_config(struct OktaConfig* config) {
+    debug_log("Reading Okta configuration");
+    
+    FILE* fp = fopen(CONFIG_FILE, "r");
+    if (!fp) {
+        debug_log("Cannot open config file: %s", strerror(errno));
+        return -1;
+    }
+
+    char line[MAX_LINE];
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        
+        char* key = strtok(line, "=");
+        char* value = strtok(NULL, "\n");
+        
+        if (key && value) {
+            while (*value == ' ') value++;
+            
+            if (strcmp(key, "issuer") == 0)
+                strncpy(config->issuer, value, MAX_LINE - 1);
+            else if (strcmp(key, "client_id") == 0)
+                strncpy(config->client_id, value, MAX_LINE - 1);
+            else if (strcmp(key, "client_secret") == 0)
+                strncpy(config->client_secret, value, MAX_LINE - 1);
+            else if (strcmp(key, "auth_endpoint") == 0)
+                strncpy(config->auth_endpoint, value, MAX_LINE - 1);
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
+// Parse MFA factors from JSON response
+static int parse_mfa_factors(const char* json_str, struct MFAFactors* factors) {
+    struct json_object* root;
+    struct json_object* _embedded;
+    struct json_object* factors_array;
+    
+    factors->count = 0;
+    
+    root = json_tokener_parse(json_str);
+    if (!root) {
+        debug_log("Failed to parse JSON response");
+        return -1;
+    }
+    
+    if (!json_object_object_get_ex(root, "_embedded", &_embedded) ||
+        !json_object_object_get_ex(_embedded, "factors", &factors_array)) {
+        json_object_put(root);
+        return -1;
+    }
+    
+    int num_factors = json_object_array_length(factors_array);
+    for (int i = 0; i < num_factors && i < MAX_FACTORS; i++) {
+        struct json_object* factor = json_object_array_get_idx(factors_array, i);
+        struct json_object* id, *type, *provider, *status;
+        
+        if (json_object_object_get_ex(factor, "id", &id))
+            strncpy(factors->factors[i].id, 
+                   json_object_get_string(id), MAX_LINE - 1);
+            
+        if (json_object_object_get_ex(factor, "factorType", &type))
+            strncpy(factors->factors[i].type, 
+                   json_object_get_string(type), MAX_LINE - 1);
+            
+        if (json_object_object_get_ex(factor, "provider", &provider))
+            strncpy(factors->factors[i].provider, 
+                   json_object_get_string(provider), MAX_LINE - 1);
+            
+        if (json_object_object_get_ex(factor, "status", &status))
+            strncpy(factors->factors[i].status, 
+                   json_object_get_string(status), MAX_LINE - 1);
+            
+        factors->count++;
+    }
+    
+    json_object_put(root);
+    return 0;
+}
+
+// Handle factor selection
+static int select_mfa_factor(pam_handle_t* pamh, struct MFAFactors* factors) {
+    char prompt[MAX_LINE * 3];
+    char* response = NULL;
+    
+    snprintf(prompt, sizeof(prompt), "Select MFA method:\n");
+    for (int i = 0; i < factors->count; i++) {
+        char factor_desc[MAX_LINE];
+        snprintf(factor_desc, sizeof(factor_desc), 
+                "%d) %s via %s\n", 
+                i + 1, factors->factors[i].type, factors->factors[i].provider);
+        strncat(prompt, factor_desc, sizeof(prompt) - strlen(prompt) - 1);
+    }
+    
+    int ret = prompt_user(pamh, PAM_PROMPT_ECHO_ON, prompt, &response);
+    if (ret != PAM_SUCCESS || !response) {
+        return -1;
+    }
+    
+    int selection = atoi(response) - 1;
+    free(response);
+    
+    if (selection < 0 || selection >= factors->count) {
+        return -1;
+    }
+    
+    return selection;
+}
+
+// Handle push verification
+static int handle_push_verification(CURL* curl, const char* state_token, 
+                                  const char* factor_id, struct MemoryStruct* chunk,
+                                  const char* verify_endpoint) {
+    CURLcode res;
+    char post_data[MAX_LINE * 2];
+    int max_attempts = PUSH_TIMEOUT_SEC * (1000 / PUSH_POLL_INTERVAL_MS);
+    
+    // Send push notification
+    snprintf(post_data, sizeof(post_data),
+             "{\"stateToken\":\"%s\"}", state_token);
+             
+    curl_easy_setopt(curl, CURLOPT_URL, verify_endpoint);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+    
+    res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        debug_log("Failed to send push notification: %s", curl_easy_strerror(res));
+        return PAM_AUTH_ERR;
+    }
+    
+    // Poll for response
+    for (int i = 0; i < max_attempts; i++) {
+        chunk->size = 0;
+        res = curl_easy_perform(curl);
+        
+        if (res != CURLE_OK) {
+            debug_log("Push verification check failed: %s", curl_easy_strerror(res));
+            return PAM_AUTH_ERR;
+        }
+        
+        struct json_object* root = json_tokener_parse(chunk->memory);
+        if (!root) {
+            debug_log("Failed to parse push verification response");
+            return PAM_AUTH_ERR;
+        }
+        
+        struct json_object* status;
+        if (json_object_object_get_ex(root, "status", &status)) {
+            const char* status_str = json_object_get_string(status);
+            if (strcmp(status_str, "SUCCESS") == 0) {
+                json_object_put(root);
+                return PAM_SUCCESS;
+            } else if (strcmp(status_str, "REJECTED") == 0) {
+                json_object_put(root);
+                return PAM_AUTH_ERR;
+            }
+        }
+        
+        json_object_put(root);
+        usleep(PUSH_POLL_INTERVAL_MS * 1000);
+    }
+    
+    debug_log("Push verification timed out");
+    return PAM_AUTH_ERR;
+}
+
+// Handle code-based verification (TOTP, SMS, Email)
+static int handle_code_verification(pam_handle_t* pamh, CURL* curl,
+                                  const char* state_token, const char* factor_id,
+                                  struct MemoryStruct* chunk, const char* verify_endpoint) {
+    CURLcode res;
+    char* mfa_code = NULL;
+    char post_data[MAX_LINE * 2];
+    
+    int ret = prompt_user(pamh, PAM_PROMPT_ECHO_ON,
+                         "Enter your verification code: ", &mfa_code);
+    if (ret != PAM_SUCCESS || !mfa_code) {
+        debug_log("Failed to get verification code");
+        return PAM_AUTH_ERR;
+    }
+    
+    snprintf(post_data, sizeof(post_data),
+             "{\"stateToken\":\"%s\",\"passCode\":\"%s\"}",
+             state_token, mfa_code);
+             
+    memset(mfa_code, 0, strlen(mfa_code));
+    free(mfa_code);
+    
+    curl_easy_setopt(curl, CURLOPT_URL, verify_endpoint);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+    
+    chunk->size = 0;
+    res = curl_easy_perform(curl);
+    
+    if (res != CURLE_OK) {
+        debug_log("Code verification failed: %s", curl_easy_strerror(res));
+        return PAM_AUTH_ERR;
+    }
+    
+    struct json_object* root = json_tokener_parse(chunk->memory);
+    if (!root) {
+        debug_log("Failed to parse code verification response");
+        return PAM_AUTH_ERR;
+    }
+    
+    struct json_object* status;
+    int result = PAM_AUTH_ERR;
+    
+    if (json_object_object_get_ex(root, "status", &status)) {
+        const char* status_str = json_object_get_string(status);
+        if (strcmp(status_str, "SUCCESS") == 0) {
+            result = PAM_SUCCESS;
+        }
+    }
+    
+    json_object_put(root);
+    return result;
+}
+
+// Handle WebAuthn/FIDO2 verification
+static int handle_webauthn_verification(pam_handle_t* pamh, CURL* curl,
+                                      const char* state_token, const char* factor_id,
+                                      struct MemoryStruct* chunk, const char* verify_endpoint) {
+    // Note: WebAuthn support requires additional browser/hardware integration
+    debug_log("WebAuthn/FIDO2 authentication not yet supported");
+    return PAM_AUTH_ERR;
+}
+
+// Main authentication function
+static int authenticate_with_okta(pam_handle_t* pamh, const char* username, 
+                                const char* password, struct OktaConfig* config) {
+    debug_log("Starting Okta authentication for user: %s", username);
+    
+    CURL* curl;
+    CURLcode res;
+    struct MemoryStruct chunk;
+    int ret = PAM_AUTH_ERR;
+
+    chunk.memory = malloc(1);
+    chunk.size = 0;
+
+    curl = curl_easy_init();
+    if (!curl) {
+        debug_log("Failed to initialize CURL");
+        free(chunk.memory);
+        return PAM_SYSTEM_ERR;
+    }
+
+    // Initial authentication request
+    char post_data[MAX_LINE * 3];
+    snprintf(post_data, sizeof(post_data),
+             "{\"username\":\"%s\",\"password\":\"%s\"}", username, password);
+
+    struct curl_slist* headers = NULL;
+    headers = curl_slist_append(headers, "Accept: application/json");
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, config->auth_endpoint);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)&chunk);
+
+    debug_log("Sending authentication request");
+    res = curl_easy_perform(curl);
+
+    if (res != CURLE_OK) {
+        debug_log("Authentication request failed: %s", curl_easy_strerror(res));
+        ret = PAM_AUTH_ERR;
+        goto cleanup;
+    }
+
+    struct json_object* root = json_tokener_parse(chunk.memory);
+    if (!root) {
+        debug_log("Failed to parse authentication response");
+        ret = PAM_AUTH_ERR;
+        goto cleanup;
+    }
+
+    struct json_object* status;
+    if (!json_object_object_get_ex(root, "status", &status)) {
+        debug_log("No status in response");
+        json_object_put(root);
+        ret = PAM_AUTH_ERR;
+        goto cleanup;
+    }
+
+    const char* status_str = json_object_get_string(status);
+    
+    if (strcmp(status_str, "SUCCESS") == 0) {
+        debug_log("Authentication successful without MFA");
+        ret = PAM_SUCCESS;
+    } else if (strcmp(status_str, "MFA_REQUIRED") == 0) {
+        debug_log("MFA required, processing MFA challenge");
+        
+        struct json_object* state_token_obj;
+        if (!json_object_object_get_ex(root, "stateToken", &state_token_obj)) {
+            debug_log("No state token found");
+            ret = PAM_AUTH_ERR;
+            goto cleanup_json;
+        }
+        const char* state_token = json_object_get_string(state_token_obj);
+        
+        // Parse available factors
+        struct MFAFactors factors;
+        if (parse_mfa_factors(chunk.memory, &factors) != 0) {
+            debug_log("Failed to parse MFA factors");
+            ret = PAM_AUTH_ERR;
+            goto cleanup_json;
+        }
+        
+        // Select factor if multiple available
+        int selected_factor = factors.count > 1 ? 
+            select_mfa_factor(pamh, &factors) : 0;
+            
+        if (selected_factor < 0) {
+            debug_log("Invalid factor selection");
+            ret = PAM_AUTH_ERR;
+            goto cleanup_json;
+        }
+        
+        // Get verification endpoint
+        char verify_endpoint[MAX_LINE * 2];
+        snprintf(verify_endpoint, sizeof(verify_endpoint),
+                "%s/factors/%s/verify",
+                config->auth_endpoint, factors.factors[selected_factor].id);
+        
+        // Handle different factor types
+        const char* factor_type = factors.factors[selected_factor].type;
+        
+        if (strcmp(factor_type, "push") == 0) {
+            ret = handle_push_verification(curl, state_token,
+                                        factors.factors[selected_factor].id,
+                                        &chunk, verify_endpoint);
+        } else if (strcmp(factor_type, "token") == 0 ||
+                   strcmp(factor_type, "sms") == 0 ||
+                   strcmp(factor_type, "email") == 0) {
+            ret = handle_code_verification(pamh, curl, state_token,
+                                        factors.factors[selected_factor].id,
+                                        &chunk, verify_endpoint);
+        } else if (strcmp(factor_type, "webauthn") == 0) {
+            ret = handle_webauthn_verification(pamh, curl, state_token,
+                                            factors.factors[selected_factor].id,
+                                            &chunk, verify_endpoint);
+        } else {
+            debug_log("Unsupported factor type: %s", factor_type);
+            ret = PAM_AUTH_ERR;
+        }
+    } else {
+        debug_log("Authentication failed with status: %s", status_str);
+        ret = PAM_AUTH_ERR;
+    }
+
+cleanup_json:
+    json_object_put(root);
+
+cleanup:
+    if (chunk.memory) free(chunk.memory);
+    if (headers) curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return ret;
+}
+
+// Main PAM authentication function
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    debug_log("Starting PAM Okta authentication module");
+    
+    char* okta_username = NULL;
+    char* okta_password = NULL;
+    int ret;
+    struct OktaConfig config;
+
+    // Read configuration
+    if (read_config(&config) != 0) {
+        debug_log("Failed to read Okta configuration");
+        return PAM_IGNORE;
+    }
+
+    // Get Okta username
+    ret = prompt_user(pamh, PAM_PROMPT_ECHO_ON,
+                     "Okta username: ", &okta_username);
+    if (ret != PAM_SUCCESS || !okta_username) {
+        debug_log("Failed to get Okta username");
+        return PAM_IGNORE;
+    }
+
+    // Get Okta password
+    ret = prompt_user(pamh, PAM_PROMPT_ECHO_OFF,
+                     "Okta password: ", &okta_password);
+    if (ret != PAM_SUCCESS || !okta_password) {
+        if (okta_username) {
+            memset(okta_username, 0, strlen(okta_username));
+            free(okta_username);
+        }
+        debug_log("Failed to get Okta password");
+        return PAM_IGNORE;
+    }
+
+    // Authenticate with Okta
+    ret = authenticate_with_okta(pamh, okta_username, okta_password, &config);
+
+    // Clean up
+    if (okta_username) {
+        memset(okta_username, 0, strlen(okta_username));
+        free(okta_username);
+    }
+    if (okta_password) {
+        memset(okta_password, 0, strlen(okta_password));
+        free(okta_password);
+    }
+
+    if (ret != PAM_SUCCESS) {
+        debug_log("Authentication failed, allowing fallthrough");
+        return PAM_IGNORE;
+    }
+
+    debug_log("Authentication completed successfully");
+    return PAM_SUCCESS;
+}
+
+// Required PAM functions
+PAM_EXTERN int pam_sm_setcred(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    return PAM_SUCCESS;
+}
