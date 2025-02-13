@@ -1,0 +1,32 @@
+       free(okta_password);
+    }
+
+    if (ret != PAM_SUCCESS) {
+        debug_log("Authentication failed, allowing fallthrough");
+        return PAM_IGNORE;
+    }
+
+    debug_log("Authentication completed successfully");
+    return PAM_SUCCESS;
+}
+
+// Required PAM functions
+PAM_EXTERN int pam_sm_setcred(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_open_session(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_close_session(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_chauthtok(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    return PAM_AUTHTOK_ERR;
+}
