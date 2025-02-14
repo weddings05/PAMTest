@@ -1,0 +1,185 @@
+        // Parse available factors
+        struct MFAFactors factors;
+        if (parse_mfa_factors(chunk.memory, &factors) != 0) {
+            debug_log("Failed to parse MFA factors");
+            ret = PAM_AUTH_ERR;
+            goto cleanup;
+        }
+        
+        debug_log("Found %d factors:", factors.count);
+        for (int i = 0; i < factors.count; i++) {
+            debug_log("Factor %d:", i + 1);
+            debug_log("  ID: %s", factors.factors[i].id);
+            debug_log("  Type: %s", factors.factors[i].type);
+            debug_log("  Provider: %s", factors.factors[i].provider);
+        }
+        
+        // Select factor if multiple available
+        int selected_factor = factors.count > 1 ? 
+            select_mfa_factor(pamh, &factors) : 0;
+            
+        if (selected_factor < 0) {
+            debug_log("Invalid factor selection");
+            ret = PAM_AUTH_ERR;
+            goto cleanup;
+        }
+        
+        debug_log("Selected factor %d: %s via %s", 
+                 selected_factor + 1,
+                 factors.factors[selected_factor].type,
+                 factors.factors[selected_factor].provider);
+        
+        // Get verification endpoint
+        char verify_endpoint[MAX_LINE * 2];
+        snprintf(verify_endpoint, sizeof(verify_endpoint),
+                "%s/factors/%s/verify",
+                config->auth_endpoint, factors.factors[selected_factor].id);
+        
+        debug_log("Verification endpoint: %s", verify_endpoint);
+        
+        // Handle different factor types
+        const char* factor_type = factors.factors[selected_factor].type;
+        
+        if (strcmp(factor_type, "push") == 0) {
+            ret = handle_push_verification(curl, state_token,
+                                        factors.factors[selected_factor].id,
+                                        &chunk, verify_endpoint);
+        } else if (strcmp(factor_type, "token") == 0 ||
+                   strcmp(factor_type, "sms") == 0 ||
+                   strcmp(factor_type, "email") == 0) {
+            ret = handle_code_verification(pamh, curl, state_token,
+                                        factors.factors[selected_factor].id,
+                                        &chunk, verify_endpoint);
+        } else if (strcmp(factor_type, "webauthn") == 0) {
+            ret = handle_webauthn_verification(pamh, curl, state_token,
+                                            factors.factors[selected_factor].id,
+                                            &chunk, verify_endpoint);
+        } else {
+            debug_log("Unsupported factor type: %s", factor_type);
+            ret = PAM_AUTH_ERR;
+        }
+        
+        debug_log("MFA verification result: %d", ret);
+    } else {
+        debug_log("Authentication failed with status: %s", status);
+        ret = PAM_AUTH_ERR;
+    }
+
+cleanup:
+    if (chunk.memory) free(chunk.memory);
+    if (headers) curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    debug_log("Authentication process completed with result: %d", ret);
+    return ret;
+}
+
+// Main PAM authentication function
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    debug_log("Starting PAM Okta authentication module");
+    
+    char* okta_username = NULL;
+    char* okta_password = NULL;
+    int ret;
+    struct OktaConfig config;
+
+    // Initialize CURL globally
+    CURLcode curl_init = curl_global_init(CURL_GLOBAL_DEFAULT);
+    if (curl_init != CURLE_OK) {
+        debug_log("Failed to initialize CURL: %s", curl_easy_strerror(curl_init));
+        return PAM_SYSTEM_ERR;
+    }
+
+    // Try to get username from PAM first
+    const char* username = NULL;
+    ret = pam_get_user(pamh, &username, "Username: ");
+    if (ret == PAM_SUCCESS && username != NULL) {
+        okta_username = strdup(username);
+        debug_log("Got username from PAM: %s", okta_username);
+    } else {
+        // Fall back to direct prompt
+        debug_log("Attempting direct username prompt");
+        ret = prompt_user(pamh, PAM_PROMPT_ECHO_ON,
+                         "Okta username: ", &okta_username);
+        if (ret != PAM_SUCCESS || !okta_username) {
+            debug_log("Failed to get username: %d", ret);
+            curl_global_cleanup();
+            return PAM_AUTH_ERR;
+        }
+    }
+
+    // Always prompt for password
+    debug_log("Attempting password prompt");
+    ret = prompt_user(pamh, PAM_PROMPT_ECHO_OFF,
+                     "Okta password: ", &okta_password);
+    if (ret != PAM_SUCCESS || !okta_password) {
+        debug_log("Failed to get password: %d", ret);
+        if (okta_username) {
+            memset(okta_username, 0, strlen(okta_username));
+            free(okta_username);
+        }
+        curl_global_cleanup();
+        return PAM_AUTH_ERR;
+    }
+
+    // Read configuration
+    if (read_config(&config) != 0) {
+        debug_log("Failed to read Okta configuration");
+        ret = PAM_AUTH_ERR;
+        goto cleanup;
+    }
+
+    // Authenticate with Okta
+    ret = authenticate_with_okta(pamh, okta_username, okta_password, &config);
+
+cleanup:
+    // Clean up
+    if (okta_username) {
+        memset(okta_username, 0, strlen(okta_username));
+        free(okta_username);
+    }
+    if (okta_password) {
+        memset(okta_password, 0, strlen(okta_password));
+        free(okta_password);
+    }
+
+    curl_global_cleanup();
+
+    if (ret != PAM_SUCCESS) {
+        debug_log("Authentication failed, returning PAM_AUTH_ERR");
+        return PAM_AUTH_ERR;
+    }
+
+    debug_log("Authentication completed successfully");
+    return PAM_SUCCESS;
+}
+
+// Required PAM functions
+PAM_EXTERN int pam_sm_setcred(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_open_session(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    const char* username;
+    int ret = pam_get_user(pamh, &username, NULL);
+    if (ret == PAM_SUCCESS) {
+        debug_log("Opening session for user: %s", username);
+    }
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_close_session(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    const char* username;
+    int ret = pam_get_user(pamh, &username, NULL);
+    if (ret == PAM_SUCCESS) {
+        debug_log("Closing session for user: %s", username);
+    }
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_chauthtok(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    return PAM_AUTHTOK_ERR;
+}
