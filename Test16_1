@@ -1,0 +1,154 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <security/pam_modules.h>
+#include <security/pam_ext.h>
+#include <security/pam_appl.h>
+#include <syslog.h>
+#include <curl/curl.h>
+#include <time.h>
+#include <errno.h>
+#include <unistd.h>
+#include <stdarg.h>
+
+#define CONFIG_FILE "/etc/exceed/okta-config.txt"
+#define DEBUG_LOG "/var/log/okta_pam_debug.log"
+#define MAX_LINE 1024
+#define MAX_RESPONSE 4096
+#define MAX_FACTORS 10
+#define PUSH_POLL_INTERVAL_MS 500
+#define PUSH_TIMEOUT_SEC 30
+
+// Structure for CURL responses
+struct MemoryStruct {
+    char* memory;
+    size_t size;
+};
+
+// Structure for MFA factors
+struct MFAFactor {
+    char id[MAX_LINE];
+    char type[MAX_LINE];
+    char provider[MAX_LINE];
+    char status[MAX_LINE];
+};
+
+struct MFAFactors {
+    struct MFAFactor factors[MAX_FACTORS];
+    int count;
+};
+
+// Structure for Okta configuration
+struct OktaConfig {
+    char issuer[MAX_LINE];
+    char client_id[MAX_LINE];
+    char client_secret[MAX_LINE];
+    char auth_endpoint[MAX_LINE];
+};
+
+// Debug logging function
+static void debug_log(const char* format, ...) {
+    FILE* fp = fopen(DEBUG_LOG, "a");
+    if (!fp) return;
+
+    time_t now = time(NULL);
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    fprintf(fp, "[%s] ", timestamp);
+    
+    va_list args;
+    va_start(args, format);
+    vfprintf(fp, format, args);
+    va_end(args);
+    
+    fprintf(fp, "\n");
+    fclose(fp);
+}
+
+// CURL write callback
+static size_t WriteMemoryCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    size_t realsize = size * nmemb;
+    struct MemoryStruct* mem = (struct MemoryStruct*)userp;
+
+    char* ptr = realloc(mem->memory, mem->size + realsize + 1);
+    if (!ptr) {
+        debug_log("Failed to allocate memory for CURL response");
+        return 0;
+    }
+
+    mem->memory = ptr;
+    memcpy(&(mem->memory[mem->size]), contents, realsize);
+    mem->size += realsize;
+    mem->memory[mem->size] = 0;
+    
+    return realsize;
+}
+
+// Helper function to find JSON sections
+static char* find_json_section(const char* json, const char* section_name) {
+    debug_log("Looking for section: %s", section_name);
+    char search_pattern[MAX_LINE];
+    snprintf(search_pattern, sizeof(search_pattern), "\"%s\":", section_name);
+    
+    char* section = strstr(json, search_pattern);
+    if (!section) {
+        debug_log("Section %s not found", section_name);
+        return NULL;
+    }
+    
+    debug_log("Found section %s", section_name);
+    return section + strlen(search_pattern);
+}
+
+// Helper function to find array start
+static char* find_array_start(const char* json, const char* array_name) {
+    debug_log("Looking for array: %s", array_name);
+    char search_pattern[MAX_LINE];
+    snprintf(search_pattern, sizeof(search_pattern), "\"%s\":[", array_name);
+    
+    char* array = strstr(json, search_pattern);
+    if (!array) {
+        debug_log("Array %s not found", array_name);
+        return NULL;
+    }
+    
+    return array + strlen(search_pattern);
+}
+
+// Extract complete JSON object
+static char* extract_json_object(const char* start, char* buffer, size_t buffer_size) {
+    int brace_count = 0;
+    const char* current = start;
+    size_t pos = 0;
+    
+    // Skip leading whitespace
+    while (*current && (*current == ' ' || *current == '\n' || *current == '\t' || *current == '\r')) {
+        current++;
+    }
+    
+    if (*current != '{') {
+        debug_log("Expected '{' at start of object, found: %c", *current);
+        return NULL;
+    }
+    
+    do {
+        if (pos >= buffer_size - 1) {
+            debug_log("Buffer overflow while extracting JSON object");
+            return NULL;
+        }
+        
+        if (*current == '{') brace_count++;
+        if (*current == '}') brace_count--;
+        
+        buffer[pos++] = *current++;
+    } while (brace_count > 0 && *current);
+    
+    buffer[pos] = '\0';
+    
+    if (brace_count != 0) {
+        debug_log("Unmatched braces in JSON object");
+        return NULL;
+    }
+    
+    return (char*)current;
+}
