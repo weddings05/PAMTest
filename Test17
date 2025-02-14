@@ -1,0 +1,121 @@
+static int parse_mfa_factors(const char* json_str, struct MFAFactors* factors) {
+    debug_log("Starting to parse MFA factors");
+    debug_log("Input JSON: %.200s...", json_str);
+    
+    factors->count = 0;
+    
+    // Find _embedded section first
+    char* embedded = strstr(json_str, "\"_embedded\":");
+    if (!embedded) {
+        debug_log("No _embedded section found");
+        return -1;
+    }
+    
+    // Find user section and skip over it
+    char* user_section = strstr(embedded, "\"user\":{");
+    if (user_section) {
+        // Skip the user section by counting braces
+        int brace_count = 1;
+        char* current = user_section + 7;  // Skip "\"user\":{"
+        while (*current && brace_count > 0) {
+            if (*current == '{') brace_count++;
+            if (*current == '}') brace_count--;
+            current++;
+        }
+        embedded = current;
+    }
+    
+    // Find factors array
+    char* factors_array = strstr(embedded, "\"factors\":[");
+    if (!factors_array) {
+        debug_log("No factors array found");
+        return -1;
+    }
+    
+    factors_array += strlen("\"factors\":[");
+    debug_log("Found factors array starting position");
+    
+    char* current = factors_array;
+    char factor_buffer[MAX_LINE * 4];
+    
+    while (*current && factors->count < MAX_FACTORS) {
+        // Skip whitespace and commas
+        while (*current && (*current == ' ' || *current == ',' || 
+               *current == '\n' || *current == '\t' || *current == '\r')) {
+            current++;
+        }
+        
+        if (*current == ']' || *current == '\0') break;
+        
+        if (*current != '{') {
+            current++;
+            continue;
+        }
+        
+        // Extract complete factor object
+        int brace_count = 1;
+        size_t buffer_pos = 0;
+        factor_buffer[buffer_pos++] = *current++;  // Copy opening brace
+        
+        while (*current && brace_count > 0 && buffer_pos < sizeof(factor_buffer) - 1) {
+            if (*current == '{') brace_count++;
+            if (*current == '}') brace_count--;
+            factor_buffer[buffer_pos++] = *current++;
+        }
+        factor_buffer[buffer_pos] = '\0';
+        
+        debug_log("Extracted factor JSON: %s", factor_buffer);
+        
+        // Search for each field specifically
+        char *id_start = strstr(factor_buffer, "\"id\":\"");
+        char *type_start = strstr(factor_buffer, "\"factorType\":\"");
+        char *provider_start = strstr(factor_buffer, "\"provider\":\"");
+        
+        if (id_start && type_start && provider_start) {
+            // Extract ID
+            id_start += strlen("\"id\":\"");
+            char* id_end = strchr(id_start, '"');
+            if (id_end) {
+                size_t id_len = id_end - id_start;
+                if (id_len < MAX_LINE) {
+                    strncpy(factors->factors[factors->count].id, id_start, id_len);
+                    factors->factors[factors->count].id[id_len] = '\0';
+                }
+            }
+            
+            // Extract Type
+            type_start += strlen("\"factorType\":\"");
+            char* type_end = strchr(type_start, '"');
+            if (type_end) {
+                size_t type_len = type_end - type_start;
+                if (type_len < MAX_LINE) {
+                    strncpy(factors->factors[factors->count].type, type_start, type_len);
+                    factors->factors[factors->count].type[type_len] = '\0';
+                }
+            }
+            
+            // Extract Provider
+            provider_start += strlen("\"provider\":\"");
+            char* provider_end = strchr(provider_start, '"');
+            if (provider_end) {
+                size_t provider_len = provider_end - provider_start;
+                if (provider_len < MAX_LINE) {
+                    strncpy(factors->factors[factors->count].provider, provider_start, provider_len);
+                    factors->factors[factors->count].provider[provider_len] = '\0';
+                }
+            }
+            
+            debug_log("Parsed factor #%d:", factors->count + 1);
+            debug_log("  ID: %s", factors->factors[factors->count].id);
+            debug_log("  Type: %s", factors->factors[factors->count].type);
+            debug_log("  Provider: %s", factors->factors[factors->count].provider);
+            
+            factors->count++;
+        } else {
+            debug_log("Missing required fields in factor object");
+        }
+    }
+    
+    debug_log("Successfully parsed %d factors", factors->count);
+    return factors->count > 0 ? 0 : -1;
+}
