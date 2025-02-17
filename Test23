@@ -1,0 +1,87 @@
+static int select_mfa_factor(pam_handle_t* pamh, struct MFAFactors* factors) {
+    char final_prompt[MAX_LINE * 6];
+    char* response = NULL;
+    
+    // Clear the buffer first
+    memset(final_prompt, 0, sizeof(final_prompt));
+    
+    // Start building the multi-line prompt using \r\n for explicit line breaks
+    const char* header = "Select MFA method:\r\n\r\n";
+    strcpy(final_prompt, header);
+    
+    // Build each factor option with a newline
+    for (int i = 0; i < factors->count; i++) {
+        char factor_line[MAX_LINE];
+        snprintf(factor_line, sizeof(factor_line), 
+                "%d) %s via %s\r\n", 
+                i + 1, 
+                factors->factors[i].type, 
+                factors->factors[i].provider);
+        strcat(final_prompt, factor_line);
+    }
+    
+    // Add final selection prompt
+    strcat(final_prompt, "\r\nEnter selection (1-");
+    char num[8];
+    snprintf(num, sizeof(num), "%d): ", factors->count);
+    strcat(final_prompt, num);
+    
+    debug_log("MFA Prompt to be displayed:\n%s", final_prompt);
+    
+    // Create PAM conversation for the prompt
+    const struct pam_conv* conv;
+    struct pam_message msg;
+    const struct pam_message* msg_ptr[1];
+    struct pam_response* resp = NULL;
+
+    int ret = pam_get_item(pamh, PAM_CONV, (const void**)&conv);
+    if (ret != PAM_SUCCESS) {
+        debug_log("Failed to get PAM conversation: %d", ret);
+        return -1;
+    }
+
+    if (conv == NULL || conv->conv == NULL) {
+        debug_log("PAM conversation is null");
+        return -1;
+    }
+
+    // Set up the message with our formatted prompt
+    msg.msg_style = PAM_PROMPT_ECHO_ON;
+    msg.msg = final_prompt;
+    msg_ptr[0] = &msg;
+
+    // Display prompt and get response
+    ret = conv->conv(1, msg_ptr, &resp, conv->appdata_ptr);
+    if (ret != PAM_SUCCESS) {
+        debug_log("Conversation failed: %d", ret);
+        return -1;
+    }
+
+    if (resp == NULL || resp[0].resp == NULL) {
+        debug_log("No response received");
+        if (resp) free(resp);
+        return -1;
+    }
+
+    // Get the selection
+    char* selection_str = resp[0].resp;
+    int selection = atoi(selection_str) - 1;
+
+    // Clean up
+    memset(resp[0].resp, 0, strlen(resp[0].resp));
+    free(resp[0].resp);
+    free(resp);
+
+    // Validate selection
+    if (selection < 0 || selection >= factors->count) {
+        debug_log("Invalid factor selection: %d", selection);
+        return -1;
+    }
+
+    debug_log("Selected factor %d: %s via %s", 
+              selection + 1,
+              factors->factors[selection].type,
+              factors->factors[selection].provider);
+
+    return selection;
+}
