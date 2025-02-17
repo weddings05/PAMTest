@@ -1,0 +1,58 @@
+static int select_mfa_factor(pam_handle_t* pamh, struct MFAFactors* factors) {
+    // Increased buffer size to ensure enough space for formatting
+    char prompt[MAX_LINE * 6];
+    char* response = NULL;
+    
+    // Initialize prompt with empty string
+    prompt[0] = '\0';
+    
+    // Build prompt string with explicit newlines and spacing
+    strcat(prompt, "Select MFA method:");
+    strcat(prompt, "\n\n");  // Add empty line after header
+    
+    // Add each factor on its own line with proper indentation
+    for (int i = 0; i < factors->count; i++) {
+        char factor_desc[MAX_LINE];
+        snprintf(factor_desc, sizeof(factor_desc), 
+                "%d) %s via %s", 
+                i + 1, 
+                factors->factors[i].type, 
+                factors->factors[i].provider);
+                
+        // Add factor description with newline
+        strcat(prompt, factor_desc);
+        strcat(prompt, "\n");
+    }
+    
+    // Add newline and selection prompt
+    strcat(prompt, "\nEnter selection (1-");
+    char num[8];
+    snprintf(num, sizeof(num), "%d", factors->count);
+    strcat(prompt, num);
+    strcat(prompt, "): ");
+    
+    debug_log("MFA selection prompt:\n%s", prompt);
+    
+    // Display prompt and get response
+    int ret = prompt_mfa(pamh, prompt, &response);
+    if (ret != PAM_SUCCESS || !response) {
+        debug_log("Failed to get factor selection");
+        return -1;
+    }
+    
+    // Parse selection
+    int selection = atoi(response) - 1;
+    free(response);
+    
+    if (selection < 0 || selection >= factors->count) {
+        debug_log("Invalid factor selection: %d", selection);
+        return -1;
+    }
+    
+    debug_log("Selected factor %d: %s via %s", 
+              selection + 1,
+              factors->factors[selection].type,
+              factors->factors[selection].provider);
+    
+    return selection;
+}
