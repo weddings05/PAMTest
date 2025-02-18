@@ -1,0 +1,91 @@
+1. First, modify the code at the start of `pam_sm_authenticate` function in your pam_okta_auth.c file:
+
+```c
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t* pamh, int flags, int argc, const char** argv) {
+    debug_log("Starting PAM Okta authentication module");
+    
+    // Parse module arguments for configuration
+    int check_previous = 1;  // Default to checking
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "no_check_previous") == 0) {
+            check_previous = 0;
+            debug_log("Disabled previous authentication check");
+            break;
+        }
+    }
+
+    if (check_previous) {
+        // Check previous authentication status
+        int ret;
+        const void *status_ptr = NULL;
+        const char *username = NULL;
+        
+        // Check if user was set by previous module
+        ret = pam_get_item(pamh, PAM_USER, (const void**)&username);
+        if (ret != PAM_SUCCESS || username == NULL) {
+            debug_log("No user set by previous module, indicating possible failure");
+            return PAM_AUTH_ERR;
+        }
+        
+        // Check previous module status
+        ret = pam_get_data(pamh, "pam_previous_retval", &status_ptr);
+        if (ret == PAM_SUCCESS && status_ptr != NULL) {
+            int retval_data = *(const int*)status_ptr;
+            debug_log("Previous PAM module status: %d", retval_data);
+            if (retval_data != PAM_SUCCESS) {
+                debug_log("Previous PAM module failed, skipping Okta authentication");
+                return PAM_AUTH_ERR;
+            }
+        }
+
+        debug_log("Previous authentication checks passed, proceeding with Okta authentication");
+    }
+
+    // Your existing code starts here
+    char* okta_username = NULL;
+    char* okta_password = NULL;
+    int ret;
+    struct OktaConfig config;
+
+    // Rest of your existing code...
+```
+
+2. Add these defines at the top of your pam_okta_auth.c file (after your existing defines):
+
+```c
+#define PAM_EXTERN extern
+#define CHECK_PREVIOUS_AUTH 1  // Global setting for auth checks
+```
+
+3. Update your PAM configuration file (exceed-node-connector):
+
+```
+# Current
+auth        requisite    pam_sepermit.so
+auth        required     pam_okta_auth.so
+
+# Change to
+auth        requisite    pam_sepermit.so
+auth        [success=1 default=bad]     pam_okta_auth.so
+```
+
+4. Add debug logging function if you haven't already (near your other utility functions):
+
+```c
+static void debug_log(const char* format, ...) {
+    FILE* fp = fopen(DEBUG_LOG, "a");
+    if (!fp) return;
+
+    time_t now = time(NULL);
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    fprintf(fp, "[%s] ", timestamp);
+    
+    va_list args;
+    va_start(args, format);
+    vfprintf(fp, format, args);
+    va_end(args);
+    
+    fprintf(fp, "\n");
+    fclose(fp);
+}
