@@ -1,0 +1,85 @@
+#include <security/pam_modules.h>
+#include <security/pam_appl.h>
+#include <security/pam_ext.h>
+#include <shadow.h>
+#include <crypt.h>
+#include <syslog.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <pwd.h>
+
+/* Verify Linux credentials manually */
+static int verify_unix_credentials(pam_handle_t *pamh, const char *username, const char *password) {
+    struct passwd *pw;
+    struct spwd *spw;
+    char *encrypted;
+    int result;
+    
+    /* Get user info */
+    pw = getpwnam(username);
+    if (pw == NULL) {
+        pam_syslog(pamh, LOG_ERR, "pam_okta: User %s not found in password database", username);
+        return 0; /* User doesn't exist */
+    }
+    
+    /* Get shadow password info */
+    spw = getspnam(username);
+    if (spw != NULL && spw->sp_pwdp != NULL) {
+        /* Use shadow password if available */
+        encrypted = strdup(spw->sp_pwdp);
+    } else if (pw->pw_passwd != NULL) {
+        /* Use regular password if no shadow */
+        encrypted = strdup(pw->pw_passwd);
+    } else {
+        pam_syslog(pamh, LOG_ERR, "pam_okta: No password found for user %s", username);
+        return 0;
+    }
+    
+    /* Check if account is locked */
+    if (encrypted[0] == '!' || encrypted[0] == '*') {
+        free(encrypted);
+        pam_syslog(pamh, LOG_ERR, "pam_okta: Account %s is locked", username);
+        return 0;
+    }
+    
+    /* Verify password */
+    char *result_hash = crypt(password, encrypted);
+    result = (result_hash != NULL && strcmp(result_hash, encrypted) == 0);
+    
+    free(encrypted);
+    return result;
+}
+
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    const char *username = NULL;
+    const char *password = NULL;
+    int retval;
+    
+    /* Get username */
+    retval = pam_get_user(pamh, &username, NULL);
+    if (retval != PAM_SUCCESS || username == NULL) {
+        pam_syslog(pamh, LOG_ERR, "pam_okta: Could not get username");
+        return PAM_AUTH_ERR;
+    }
+    
+    /* Get password */
+    retval = pam_get_authtok(pamh, PAM_AUTHTOK, &password, NULL);
+    if (retval != PAM_SUCCESS || password == NULL) {
+        pam_syslog(pamh, LOG_ERR, "pam_okta: Could not get password");
+        return PAM_AUTH_ERR;
+    }
+    
+    /* Verify Linux credentials */
+    if (!verify_unix_credentials(pamh, username, password)) {
+        pam_syslog(pamh, LOG_ERR, "pam_okta: Linux authentication failed for user %s", username);
+        return PAM_AUTH_ERR;
+    }
+    
+    pam_syslog(pamh, LOG_NOTICE, "pam_okta: Linux authentication succeeded for user %s", username);
+    
+    /* Continue with Okta authentication */
+    /* ... your existing Okta authentication code ... */
+    
+    return PAM_SUCCESS;
+}
