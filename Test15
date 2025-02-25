@@ -1,0 +1,56 @@
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    const char *username = NULL;
+    const char *password = NULL;
+    const void *item = NULL;
+    int retval;
+    int debug = is_debug_mode(argc, argv);
+    
+    /* Get the service name to detect desktop launch */
+    const char *service = NULL;
+    pam_get_item(pamh, PAM_SERVICE, (const void **)&service);
+    INFO_LOG(pamh, "Called by PAM service: %s", service ? service : "unknown");
+    
+    /* Check for desktop session launch */
+    int is_desktop_launch = 0;
+    
+    /* Check service name patterns that might indicate desktop launch */
+    if (service && (
+            strstr(service, "desktop") || 
+            strstr(service, "session") || 
+            strstr(service, "exceed-x") ||
+            strstr(service, "etx-session") ||
+            strstr(service, "xsession"))) {
+        is_desktop_launch = 1;
+    }
+    
+    /* Also check for specific environment variables that might indicate desktop launch */
+    char **env;
+    pam_get_item(pamh, PAM_ENVIRON, (const void **)&env);
+    if (env) {
+        for (int i = 0; env[i] != NULL; i++) {
+            if (strstr(env[i], "ETX_SESSION_") != NULL || 
+                strstr(env[i], "DISPLAY=") != NULL ||
+                strstr(env[i], "XAUTHORITY=") != NULL) {
+                is_desktop_launch = 1;
+                DEBUG_LOG(pamh, "Desktop launch detected from env: %s", env[i]);
+                break;
+            }
+        }
+    }
+    
+    /* Skip our authentication for desktop launch */
+    if (is_desktop_launch) {
+        INFO_LOG(pamh, "Desktop launch detected, skipping Okta authentication");
+        return PAM_SUCCESS;  /* Return success to allow other modules to run */
+    }
+    
+    /* Get username */
+    retval = pam_get_user(pamh, &username, NULL);
+    if (retval != PAM_SUCCESS) {
+        ERR_LOG(pamh, "Failed to get username: %s", pam_strerror(pamh, retval));
+        return PAM_AUTH_ERR;
+    }
+    
+    /* Rest of your authentication code continues as normal */
+    /* ... */
+}
