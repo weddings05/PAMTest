@@ -1,0 +1,80 @@
+```c
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    const char *username = NULL;
+    const char *password = NULL;
+    const void *item = NULL;
+    int retval;
+    int debug = is_debug_mode(argc, argv);
+    
+    /* Get username first (we need it for logging and detection) */
+    retval = pam_get_user(pamh, &username, NULL);
+    if (retval != PAM_SUCCESS || username == NULL) {
+        ERR_LOG(pamh, "Failed to get username");
+        return PAM_AUTH_ERR;
+    }
+    
+    NOTICE_LOG(pamh, "Authentication request for user: %s", username);
+    
+    /* Check for silent/non-interactive authentication */
+    int is_silent_auth = 0;
+    
+    /* Method 1: Check if PAM_SILENT flag is set */
+    if (flags & PAM_SILENT) {
+        NOTICE_LOG(pamh, "PAM_SILENT flag detected");
+        is_silent_auth = 1;
+    }
+    
+    /* Method 2: Check for authtok - silent calls often don't provide passwords */
+    const char *authtok = NULL;
+    retval = pam_get_item(pamh, PAM_AUTHTOK, (const void **)&authtok);
+    if (retval != PAM_SUCCESS || authtok == NULL) {
+        NOTICE_LOG(pamh, "No authtok available, likely a silent call");
+        is_silent_auth = 1;
+    }
+    
+    /* Method 3: Check for stored authentication marker */
+    char auth_marker_path[256];
+    snprintf(auth_marker_path, sizeof(auth_marker_path), "/tmp/pam_okta_auth_%s", username);
+    struct stat st;
+    time_t current_time = time(NULL);
+    
+    if (stat(auth_marker_path, &st) == 0) {
+        /* File exists, check how old it is */
+        time_t file_age = current_time - st.st_mtime;
+        NOTICE_LOG(pamh, "Found auth marker file, age: %ld seconds", file_age);
+        
+        if (file_age < 3600) { /* Less than an hour old */
+            NOTICE_LOG(pamh, "Recent authentication marker found");
+            is_silent_auth = 1;
+        }
+    }
+    
+    /* Method 4: Check specific environment variables that may indicate desktop launch */
+    if (getenv("DISPLAY") != NULL) {
+        NOTICE_LOG(pamh, "DISPLAY environment variable found");
+        is_silent_auth = 1;
+    }
+    
+    /* Skip Okta authentication for silent/desktop launch calls */
+    if (is_silent_auth) {
+        NOTICE_LOG(pamh, "Silent/desktop authentication detected, skipping Okta authentication");
+        return PAM_SUCCESS;  /* Return success to allow other modules to run */
+    }
+    
+    NOTICE_LOG(pamh, "Interactive login detected, proceeding with full authentication");
+    
+    /* Continue with normal authentication process */
+    /* ... your existing code to verify credentials ... */
+    
+    /* After successful authentication, create a marker file */
+    FILE *marker = fopen(auth_marker_path, "w");
+    if (marker) {
+        fprintf(marker, "%ld", current_time);
+        fclose(marker);
+        /* Ensure the file is only readable by the user */
+        chmod(auth_marker_path, 0600);
+        NOTICE_LOG(pamh, "Created authentication marker file");
+    }
+    
+    return PAM_SUCCESS;
+}
