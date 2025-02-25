@@ -1,0 +1,210 @@
+#include <security/pam_modules.h>
+#include <security/pam_appl.h>
+#include <security/pam_ext.h>
+#include <shadow.h>
+#include <crypt.h>
+#include <syslog.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <pwd.h>
+#include <errno.h>
+
+#define PAM_OKTA_LOG_PREFIX "pam_okta"
+#define DEBUG_LOG(pamh, format, ...) \
+    pam_syslog(pamh, LOG_DEBUG, PAM_OKTA_LOG_PREFIX ": " format, ##__VA_ARGS__)
+#define INFO_LOG(pamh, format, ...) \
+    pam_syslog(pamh, LOG_INFO, PAM_OKTA_LOG_PREFIX ": " format, ##__VA_ARGS__)
+#define ERR_LOG(pamh, format, ...) \
+    pam_syslog(pamh, LOG_ERR, PAM_OKTA_LOG_PREFIX ": " format, ##__VA_ARGS__)
+
+/* Verify Linux credentials manually */
+static int verify_unix_credentials(pam_handle_t *pamh, const char *username, const char *password) {
+    struct passwd *pw;
+    struct spwd *spw;
+    char *encrypted;
+    int result;
+    
+    if (!username || !password) {
+        ERR_LOG(pamh, "Missing username or password");
+        return 0;
+    }
+    
+    DEBUG_LOG(pamh, "Checking credentials for user: %s", username);
+    
+    /* Get user info */
+    errno = 0;
+    pw = getpwnam(username);
+    if (pw == NULL) {
+        if (errno != 0) {
+            ERR_LOG(pamh, "Error looking up user %s: %s", username, strerror(errno));
+        } else {
+            ERR_LOG(pamh, "User %s not found in password database", username);
+        }
+        return 0; /* User doesn't exist */
+    }
+    
+    DEBUG_LOG(pamh, "Found user entry for %s (uid=%d)", username, pw->pw_uid);
+    
+    /* Get shadow password info */
+    errno = 0;
+    spw = getspnam(username);
+    if (spw == NULL) {
+        if (errno != 0) {
+            ERR_LOG(pamh, "Error accessing shadow database: %s", strerror(errno));
+        } else {
+            DEBUG_LOG(pamh, "No shadow entry found for %s, using passwd entry", username);
+        }
+    } else {
+        DEBUG_LOG(pamh, "Found shadow entry for %s", username);
+    }
+    
+    if (spw != NULL && spw->sp_pwdp != NULL) {
+        /* Use shadow password if available */
+        encrypted = strdup(spw->sp_pwdp);
+        DEBUG_LOG(pamh, "Using shadow password hash for verification");
+    } else if (pw->pw_passwd != NULL) {
+        /* Use regular password if no shadow */
+        encrypted = strdup(pw->pw_passwd);
+        DEBUG_LOG(pamh, "Using passwd password hash for verification");
+    } else {
+        ERR_LOG(pamh, "No password hash found for user %s", username);
+        return 0;
+    }
+    
+    /* Check if account is locked */
+    if (encrypted[0] == '!' || encrypted[0] == '*') {
+        ERR_LOG(pamh, "Account %s is locked", username);
+        free(encrypted);
+        return 0;
+    }
+    
+    DEBUG_LOG(pamh, "Verifying password for %s", username);
+    
+    /* Verify password */
+    char *result_hash = crypt(password, encrypted);
+    if (result_hash == NULL) {
+        ERR_LOG(pamh, "Error computing password hash: %s", strerror(errno));
+        free(encrypted);
+        return 0;
+    }
+    
+    result = (strcmp(result_hash, encrypted) == 0);
+    
+    if (result) {
+        INFO_LOG(pamh, "Linux authentication succeeded for user %s", username);
+    } else {
+        ERR_LOG(pamh, "Linux authentication failed for user %s", username);
+    }
+    
+    free(encrypted);
+    return result;
+}
+
+/* Indicates whether module should run in debug mode */
+static int is_debug_mode(int argc, const char **argv) {
+    int i;
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "debug") == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    const char *username = NULL;
+    const char *password = NULL;
+    const void *item = NULL;
+    int retval;
+    int debug = is_debug_mode(argc, argv);
+    
+    /* Start authentication process */
+    INFO_LOG(pamh, "Starting authentication process");
+    
+    /* Get username */
+    retval = pam_get_user(pamh, &username, NULL);
+    if (retval != PAM_SUCCESS) {
+        ERR_LOG(pamh, "Failed to get username: %s", pam_strerror(pamh, retval));
+        return PAM_AUTH_ERR;
+    }
+    
+    if (username == NULL) {
+        ERR_LOG(pamh, "Got NULL username");
+        return PAM_AUTH_ERR;
+    }
+    
+    INFO_LOG(pamh, "Got username: %s", username);
+    
+    /* Get password */
+    retval = pam_get_item(pamh, PAM_AUTHTOK, &item);
+    if (retval != PAM_SUCCESS || item == NULL) {
+        ERR_LOG(pamh, "Failed to get password via PAM_AUTHTOK: %s", 
+               retval != PAM_SUCCESS ? pam_strerror(pamh, retval) : "password is NULL");
+        
+        /* Try to get password through pam_get_authtok */
+        DEBUG_LOG(pamh, "Trying pam_get_authtok to obtain password");
+        retval = pam_get_authtok(pamh, PAM_AUTHTOK, &password, NULL);
+        
+        if (retval != PAM_SUCCESS || password == NULL) {
+            ERR_LOG(pamh, "Failed to get password via pam_get_authtok: %s",
+                   retval != PAM_SUCCESS ? pam_strerror(pamh, retval) : "password is NULL");
+            
+            /* Try PAM_OLDAUTHTOK as a last resort */
+            DEBUG_LOG(pamh, "Trying PAM_OLDAUTHTOK to obtain password");
+            retval = pam_get_item(pamh, PAM_OLDAUTHTOK, &item);
+            
+            if (retval != PAM_SUCCESS || item == NULL) {
+                ERR_LOG(pamh, "Could not obtain password through any method");
+                return PAM_AUTH_ERR;
+            }
+            
+            password = (const char *)item;
+            INFO_LOG(pamh, "Successfully got password via PAM_OLDAUTHTOK");
+        } else {
+            INFO_LOG(pamh, "Successfully got password via pam_get_authtok");
+        }
+    } else {
+        password = (const char *)item;
+        INFO_LOG(pamh, "Successfully got password via PAM_AUTHTOK");
+    }
+    
+    /* Log password length for debugging (without revealing the password) */
+    if (debug && password != NULL) {
+        DEBUG_LOG(pamh, "Password retrieved (length: %zu)", strlen(password));
+    }
+    
+    /* Verify Linux credentials */
+    if (!verify_unix_credentials(pamh, username, password)) {
+        ERR_LOG(pamh, "Linux authentication failed for user %s, skipping Okta authentication", username);
+        return PAM_AUTH_ERR;
+    }
+    
+    INFO_LOG(pamh, "Linux authentication succeeded for user %s, proceeding with Okta authentication", username);
+    
+    /* Continue with your existing Okta authentication code */
+    /* ... insert your Okta authentication logic here ... */
+    
+    return PAM_SUCCESS;
+}
+
+/* Required PAM interface functions */
+PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_close_session(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_chauthtok(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
