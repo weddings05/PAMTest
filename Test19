@@ -1,0 +1,468 @@
+#include <security/pam_modules.h>
+#include <security/pam_appl.h>
+#include <security/pam_ext.h>
+#include <shadow.h>
+#include <crypt.h>
+#include <syslog.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <pwd.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <fcntl.h>
+
+#define PAM_OKTA_LOG_PREFIX "pam_okta"
+#define DEBUG_LOG(pamh, format, ...) \
+    pam_syslog(pamh, LOG_DEBUG, PAM_OKTA_LOG_PREFIX ": " format, ##__VA_ARGS__)
+#define INFO_LOG(pamh, format, ...) \
+    pam_syslog(pamh, LOG_INFO, PAM_OKTA_LOG_PREFIX ": " format, ##__VA_ARGS__)
+#define ERR_LOG(pamh, format, ...) \
+    pam_syslog(pamh, LOG_ERR, PAM_OKTA_LOG_PREFIX ": " format, ##__VA_ARGS__)
+#define NOTICE_LOG(pamh, format, ...) \
+    pam_syslog(pamh, LOG_NOTICE, PAM_OKTA_LOG_PREFIX ": " format, ##__VA_ARGS__)
+
+/* Marker file base directory */
+#define MARKER_DIR "/tmp"
+#define MARKER_PREFIX "pam_okta_auth_"
+#define MARKER_MAX_AGE 28800  /* 8 hours in seconds */
+#define SESSION_MIN_AGE 5     /* Minimum seconds between login and desktop launch */
+
+/* Verify Linux credentials manually */
+static int verify_unix_credentials(pam_handle_t *pamh, const char *username, const char *password) {
+    struct passwd *pw;
+    struct spwd *spw;
+    char *encrypted;
+    int result;
+    
+    if (!username || !password) {
+        ERR_LOG(pamh, "Missing username or password");
+        return 0;
+    }
+    
+    DEBUG_LOG(pamh, "Checking credentials for user: %s", username);
+    
+    /* Get user info */
+    errno = 0;
+    pw = getpwnam(username);
+    if (pw == NULL) {
+        if (errno != 0) {
+            ERR_LOG(pamh, "Error looking up user %s: %s", username, strerror(errno));
+        } else {
+            ERR_LOG(pamh, "User %s not found in password database", username);
+        }
+        return 0; /* User doesn't exist */
+    }
+    
+    DEBUG_LOG(pamh, "Found user entry for %s (uid=%d)", username, pw->pw_uid);
+    
+    /* Get shadow password info */
+    errno = 0;
+    spw = getspnam(username);
+    if (spw == NULL) {
+        if (errno != 0) {
+            ERR_LOG(pamh, "Error accessing shadow database: %s", strerror(errno));
+        } else {
+            DEBUG_LOG(pamh, "No shadow entry found for %s, using passwd entry", username);
+        }
+    } else {
+        DEBUG_LOG(pamh, "Found shadow entry for %s", username);
+    }
+    
+    if (spw != NULL && spw->sp_pwdp != NULL) {
+        /* Use shadow password if available */
+        encrypted = strdup(spw->sp_pwdp);
+        DEBUG_LOG(pamh, "Using shadow password hash for verification");
+    } else if (pw->pw_passwd != NULL) {
+        /* Use regular password if no shadow */
+        encrypted = strdup(pw->pw_passwd);
+        DEBUG_LOG(pamh, "Using passwd password hash for verification");
+    } else {
+        ERR_LOG(pamh, "No password hash found for user %s", username);
+        return 0;
+    }
+    
+    /* Check if account is locked */
+    if (encrypted[0] == '!' || encrypted[0] == '*') {
+        ERR_LOG(pamh, "Account %s is locked", username);
+        free(encrypted);
+        return 0;
+    }
+    
+    DEBUG_LOG(pamh, "Verifying password for %s", username);
+    
+    /* Verify password */
+    char *result_hash = crypt(password, encrypted);
+    if (result_hash == NULL) {
+        ERR_LOG(pamh, "Error computing password hash: %s", strerror(errno));
+        free(encrypted);
+        return 0;
+    }
+    
+    result = (strcmp(result_hash, encrypted) == 0);
+    
+    if (result) {
+        INFO_LOG(pamh, "Linux authentication succeeded for user %s", username);
+    } else {
+        ERR_LOG(pamh, "Linux authentication failed for user %s", username);
+    }
+    
+    free(encrypted);
+    return result;
+}
+
+/* Indicates whether module should run in debug mode */
+static int is_debug_mode(int argc, const char **argv) {
+    int i;
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "debug") == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Generate path to user's marker file */
+static void get_marker_path(char *path, size_t size, const char *username) {
+    snprintf(path, size, "%s/%s%s", MARKER_DIR, MARKER_PREFIX, username);
+}
+
+/* Create marker file with session info */
+static void create_marker_file(pam_handle_t *pamh, const char *username) {
+    char marker_path[PATH_MAX];
+    get_marker_path(marker_path, sizeof(marker_path), username);
+    
+    /* Get session ID if available */
+    const char *etx_session = getenv("ETX_SESSION_ID");
+    
+    /* Get remote host/IP */
+    const char *remote_host = NULL;
+    pam_get_item(pamh, PAM_RHOST, (const void **)&remote_host);
+    
+    /* Get TTY */
+    const char *tty = NULL;
+    pam_get_item(pamh, PAM_TTY, (const void **)&tty);
+    
+    /* Create file with exclusive flag to prevent race conditions */
+    int fd = open(marker_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd == -1) {
+        ERR_LOG(pamh, "Failed to create marker file: %s", strerror(errno));
+        return;
+    }
+    
+    /* Write session info to file */
+    FILE *f = fdopen(fd, "w");
+    if (f) {
+        fprintf(f, "%ld\n", time(NULL));  /* Timestamp */
+        fprintf(f, "%s\n", etx_session ? etx_session : "");  /* Session ID */
+        fprintf(f, "%s\n", remote_host ? remote_host : "");  /* Remote host */
+        fprintf(f, "%s\n", tty ? tty : "");  /* TTY */
+        fclose(f);  /* Also closes fd */
+        
+        NOTICE_LOG(pamh, "Created authentication marker with session info for %s", username);
+    } else {
+        close(fd);
+        ERR_LOG(pamh, "Failed to open marker file stream: %s", strerror(errno));
+    }
+}
+
+/* Read marker file and determine if it matches current session */
+static int check_marker_file(pam_handle_t *pamh, const char *username, int *is_login_screen) {
+    char marker_path[PATH_MAX];
+    get_marker_path(marker_path, sizeof(marker_path), username);
+    
+    struct stat st;
+    if (stat(marker_path, &st) != 0) {
+        /* File doesn't exist */
+        DEBUG_LOG(pamh, "No marker file found for %s", username);
+        return 0;
+    }
+    
+    /* Check if file is too old */
+    time_t current_time = time(NULL);
+    if (current_time - st.st_mtime > MARKER_MAX_AGE) {
+        NOTICE_LOG(pamh, "Marker file for %s is too old (%ld seconds), removing", 
+                 username, current_time - st.st_mtime);
+        unlink(marker_path);
+        return 0;
+    }
+    
+    /* Check if file is too recent - indicates a login screen where auth just happened */
+    if (current_time - st.st_mtime < SESSION_MIN_AGE) {
+        DEBUG_LOG(pamh, "Marker file for %s is very recent (%ld seconds old)",
+                username, current_time - st.st_mtime);
+        *is_login_screen = 1;
+        return 0;
+    }
+    
+    /* Read the file */
+    FILE *f = fopen(marker_path, "r");
+    if (!f) {
+        ERR_LOG(pamh, "Failed to open marker file: %s", strerror(errno));
+        return 0;
+    }
+    
+    /* Read and parse marker content */
+    char buffer[256];
+    time_t auth_time = 0;
+    char stored_session_id[128] = "";
+    char stored_remote_host[128] = "";
+    char stored_tty[128] = "";
+    
+    /* Read timestamp */
+    if (fgets(buffer, sizeof(buffer), f)) {
+        auth_time = atol(buffer);
+    }
+    
+    /* Read session ID */
+    if (fgets(buffer, sizeof(buffer), f)) {
+        buffer[strcspn(buffer, "\r\n")] = 0;  /* Remove newline */
+        strncpy(stored_session_id, buffer, sizeof(stored_session_id) - 1);
+    }
+    
+    /* Read remote host */
+    if (fgets(buffer, sizeof(buffer), f)) {
+        buffer[strcspn(buffer, "\r\n")] = 0;  /* Remove newline */
+        strncpy(stored_remote_host, buffer, sizeof(stored_remote_host) - 1);
+    }
+    
+    /* Read TTY */
+    if (fgets(buffer, sizeof(buffer), f)) {
+        buffer[strcspn(buffer, "\r\n")] = 0;  /* Remove newline */
+        strncpy(stored_tty, buffer, sizeof(stored_tty) - 1);
+    }
+    
+    fclose(f);
+    
+    /* Get current session info */
+    const char *current_session = getenv("ETX_SESSION_ID");
+    const char *remote_host = NULL;
+    pam_get_item(pamh, PAM_RHOST, (const void **)&remote_host);
+    const char *tty = NULL;
+    pam_get_item(pamh, PAM_TTY, (const void **)&tty);
+    
+    /* Log the comparison data */
+    DEBUG_LOG(pamh, "Marker comparison - Stored: session=[%s], host=[%s], tty=[%s]", 
+            stored_session_id, stored_remote_host, stored_tty);
+    DEBUG_LOG(pamh, "Marker comparison - Current: session=[%s], host=[%s], tty=[%s]", 
+            current_session ? current_session : "", 
+            remote_host ? remote_host : "", 
+            tty ? tty : "");
+    
+    /* Check for signs of desktop launch */
+    int is_desktop_launch = 0;
+    
+    /* Session ID match is strongest indicator */
+    if (stored_session_id[0] && current_session && 
+        strcmp(stored_session_id, current_session) == 0) {
+        NOTICE_LOG(pamh, "Session ID match detected - likely desktop launch");
+        is_desktop_launch = 1;
+    }
+    /* IP/remote host match */
+    else if (stored_remote_host[0] && remote_host && 
+             strcmp(stored_remote_host, remote_host) == 0) {
+        /* Same connection source but different session */
+        if (*is_login_screen) {
+            NOTICE_LOG(pamh, "Same host but login screen - likely relogin");
+            unlink(marker_path);  /* Clean up old marker on relogin */
+            return 0;
+        } else {
+            NOTICE_LOG(pamh, "Remote host match detected - possible desktop launch");
+            is_desktop_launch = 1;
+        }
+    }
+    /* TTY pattern indicating X11 */
+    else if (tty && (strstr(tty, ":") || strstr(tty, "pts/"))) {
+        NOTICE_LOG(pamh, "X11-style TTY detected - likely desktop launch");
+        is_desktop_launch = 1;
+    }
+    
+    return is_desktop_launch;
+}
+
+/* Detect if this is a login screen or desktop launch */
+static int detect_context(pam_handle_t *pamh, const char *username, int *is_login_screen) {
+    /* Default to assuming it's not a login screen */
+    *is_login_screen = 0;
+    
+    /* Check for web login environment variables */
+    if (getenv("HTTP_HOST") || getenv("REMOTE_ADDR") || getenv("REQUEST_URI") ||
+        getenv("HTTP_USER_AGENT") || getenv("REQUEST_METHOD")) {
+        NOTICE_LOG(pamh, "Web environment variables detected - likely login screen");
+        *is_login_screen = 1;
+    }
+    
+    /* Check service name pattern */
+    const char *service = NULL;
+    pam_get_item(pamh, PAM_SERVICE, (const void **)&service);
+    if (service) {
+        NOTICE_LOG(pamh, "Service name: %s", service);
+        
+        /* Some services clearly indicate login vs desktop */
+        if (strstr(service, "login") || strstr(service, "auth")) {
+            NOTICE_LOG(pamh, "Login-related service detected");
+            *is_login_screen = 1;
+        }
+    }
+    
+    /* Check TTY for clues */
+    const char *tty = NULL;
+    pam_get_item(pamh, PAM_TTY, (const void **)&tty);
+    if (tty) {
+        NOTICE_LOG(pamh, "TTY: %s", tty);
+        
+        /* Console TTY usually indicates login screen */
+        if (strstr(tty, "tty") && !strstr(tty, "pts/")) {
+            NOTICE_LOG(pamh, "Console TTY detected - likely login screen");
+            *is_login_screen = 1;
+        }
+        
+        /* X11-style TTY usually indicates desktop session */
+        if (strstr(tty, ":")) {
+            if (*is_login_screen) {
+                NOTICE_LOG(pamh, "X11 TTY but login indicators present - conflict");
+            } else {
+                NOTICE_LOG(pamh, "X11 TTY detected - likely desktop launch");
+                return 1;  /* Desktop launch */
+            }
+        }
+    }
+    
+    /* Check marker file for session match */
+    if (check_marker_file(pamh, username, is_login_screen)) {
+        return 1;  /* Desktop launch */
+    }
+    
+    /* If we're still not sure, look for desktop environment vars */
+    if (!*is_login_screen) {
+        if (getenv("DISPLAY") || getenv("XAUTHORITY") || 
+            getenv("DESKTOP_SESSION") || getenv("XDG_SESSION_TYPE")) {
+            NOTICE_LOG(pamh, "Desktop environment vars detected - likely desktop launch");
+            return 1;  /* Desktop launch */
+        }
+    }
+    
+    /* If we reach here and is_login_screen is false, we're not sure,
+       so we'll assume it's not a desktop launch to be safe */
+    if (!*is_login_screen) {
+        NOTICE_LOG(pamh, "Context unclear - defaulting to requiring authentication");
+    }
+    
+    return 0;  /* Not a desktop launch */
+}
+
+/* Main authentication function */
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    const char *username = NULL;
+    const char *password = NULL;
+    int retval;
+    int debug = is_debug_mode(argc, argv);
+    
+    NOTICE_LOG(pamh, "Starting authentication process");
+    
+    /* Get username */
+    retval = pam_get_user(pamh, &username, NULL);
+    if (retval != PAM_SUCCESS || username == NULL) {
+        ERR_LOG(pamh, "Failed to get username");
+        return PAM_AUTH_ERR;
+    }
+    
+    NOTICE_LOG(pamh, "Authentication request for user: %s", username);
+    
+    /* Detect if this is a login screen or desktop launch */
+    int is_login_screen = 0;
+    int is_desktop_launch = detect_context(pamh, username, &is_login_screen);
+    
+    /* Skip authentication for desktop launch */
+    if (is_desktop_launch) {
+        NOTICE_LOG(pamh, "Desktop launch detected, skipping authentication for %s", username);
+        return PAM_SUCCESS;
+    }
+    
+    /* For login screen or unclear context, proceed with full authentication */
+    NOTICE_LOG(pamh, "Login context detected, proceeding with full authentication for %s", username);
+    
+    /* Get password - cautiously to avoid prompting in non-interactive contexts */
+    const void *item = NULL;
+    retval = pam_get_item(pamh, PAM_AUTHTOK, &item);
+    
+    if (retval == PAM_SUCCESS && item != NULL) {
+        password = (const char *)item;
+        NOTICE_LOG(pamh, "Got password from PAM_AUTHTOK");
+    } else {
+        /* Only try to get password via prompt if this is definitely a login screen */
+        if (is_login_screen) {
+            NOTICE_LOG(pamh, "Attempting to get password via pam_get_authtok");
+            retval = pam_get_authtok(pamh, PAM_AUTHTOK, &password, NULL);
+            
+            if (retval != PAM_SUCCESS || password == NULL) {
+                ERR_LOG(pamh, "Failed to get password: %s", 
+                      retval != PAM_SUCCESS ? pam_strerror(pamh, retval) : "NULL password");
+                return PAM_AUTH_ERR;
+            }
+            
+            NOTICE_LOG(pamh, "Successfully got password via pam_get_authtok");
+        } else {
+            ERR_LOG(pamh, "No password available and context unclear");
+            return PAM_AUTH_ERR;
+        }
+    }
+    
+    /* Log password length for debugging without revealing password */
+    if (debug && password != NULL) {
+        DEBUG_LOG(pamh, "Password retrieved (length: %zu)", strlen(password));
+    }
+    
+    /* Verify Linux credentials */
+    if (!verify_unix_credentials(pamh, username, password)) {
+        ERR_LOG(pamh, "Linux authentication failed for user %s, skipping Okta", username);
+        return PAM_AUTH_ERR;
+    }
+    
+    NOTICE_LOG(pamh, "Linux authentication succeeded for user %s", username);
+    
+    /* Continue with Okta authentication */
+    /* ... insert your Okta authentication code here ... */
+    
+    /* After successful authentication, create marker file for future launches */
+    create_marker_file(pamh, username);
+    
+    return PAM_SUCCESS;
+}
+
+/* Clean up on session close/logout */
+PAM_EXTERN int pam_sm_close_session(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    const char *username = NULL;
+    pam_get_user(pamh, &username, NULL);
+    
+    if (username) {
+        char marker_path[PATH_MAX];
+        get_marker_path(marker_path, sizeof(marker_path), username);
+        
+        /* Remove marker file on session close/logout */
+        if (unlink(marker_path) == 0) {
+            NOTICE_LOG(pamh, "Removed auth marker file during logout for %s", username);
+        }
+    }
+    
+    return PAM_SUCCESS;
+}
+
+/* Required PAM interface functions */
+PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
+
+PAM_EXTERN int pam_sm_chauthtok(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    return PAM_SUCCESS;
+}
