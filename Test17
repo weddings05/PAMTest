@@ -1,0 +1,69 @@
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    const char *username = NULL;
+    const char *password = NULL;
+    const void *item = NULL;
+    int retval;
+    int debug = is_debug_mode(argc, argv);
+    
+    /* Get the service name to detect desktop launch */
+    const char *service = NULL;
+    pam_get_item(pamh, PAM_SERVICE, (const void **)&service);
+    INFO_LOG(pamh, "Called by PAM service: %s", service ? service : "unknown");
+    
+    /* Check for desktop session launch */
+    int is_desktop_launch = 0;
+    
+    /* Check service name patterns that might indicate desktop launch */
+    if (service && (
+            strstr(service, "desktop") || 
+            strstr(service, "session") || 
+            strstr(service, "exceed-x") ||
+            strstr(service, "etx-session") ||
+            strstr(service, "xsession"))) {
+        is_desktop_launch = 1;
+        INFO_LOG(pamh, "Desktop launch detected from service name: %s", service);
+    }
+    
+    /* Check environment variables using getenv() instead of PAM_ENVIRON */
+    const char *display = getenv("DISPLAY");
+    if (display) {
+        INFO_LOG(pamh, "Found DISPLAY environment variable: %s", display);
+        is_desktop_launch = 1;
+    }
+    
+    const char *xauthority = getenv("XAUTHORITY");
+    if (xauthority) {
+        INFO_LOG(pamh, "Found XAUTHORITY environment variable: %s", xauthority);
+        is_desktop_launch = 1;
+    }
+    
+    const char *etx_session = getenv("ETX_SESSION");
+    if (etx_session) {
+        INFO_LOG(pamh, "Found ETX_SESSION environment variable: %s", etx_session);
+        is_desktop_launch = 1;
+    }
+    
+    /* Get TTY info which can also indicate X11 sessions */
+    const char *tty = NULL;
+    pam_get_item(pamh, PAM_TTY, (const void **)&tty);
+    if (tty && (strstr(tty, ":") || strstr(tty, "pts/"))) {
+        INFO_LOG(pamh, "Desktop launch detected from TTY: %s", tty);
+        is_desktop_launch = 1;
+    }
+    
+    /* Skip our authentication for desktop launch */
+    if (is_desktop_launch) {
+        INFO_LOG(pamh, "Desktop launch detected, skipping Okta authentication");
+        return PAM_SUCCESS;  /* Return success to allow other modules to run */
+    }
+    
+    /* Get username */
+    retval = pam_get_user(pamh, &username, NULL);
+    if (retval != PAM_SUCCESS) {
+        ERR_LOG(pamh, "Failed to get username: %s", pam_strerror(pamh, retval));
+        return PAM_AUTH_ERR;
+    }
+    
+    /* Rest of your authentication code continues as normal */
+    /* ... */
+}
